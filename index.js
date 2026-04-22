@@ -1,63 +1,45 @@
 const express = require('express');
 const app = express();
-const cron = require('node-cron');
 
 const Redis = require("ioredis");
 const redis = new Redis();
 
 const { v4: uuidv4 } = require('uuid');
-const axios = require("axios");
 
 app.use(express.json());
 
-// Store running jobs in memory (important for stopping)
-let runningJobs = {};
-
-// ✅ CREATE TASK
+// 🔹 CREATE TASK
 app.post("/schedule", async (req, res) => {
-  const { time, message } = req.body;
+  const { time, message, type, url, payload } = req.body;
+
+  // validation
+  if (!time) {
+    return res.status(400).json({ error: "Time is required" });
+  }
+
+  if (type === "http" && !url) {
+    return res.status(400).json({ error: "URL required for HTTP task" });
+  }
 
   const taskId = uuidv4();
 
   const task = {
     id: taskId,
     time,
-    message,
-    counter: 0
+    message: message || "",
+    type: type || "log",
+    url: url || null,
+    payload: payload || null,
+    counter: 0,
+    status: "pending"
   };
 
-  // Save in Redis
   await redis.set(`task:${taskId}`, JSON.stringify(task));
-
-  // Schedule cron
-  const job = cron.schedule(time, async () => {
-
-    // 🔐 Redis lock (prevents multiple servers running same job)
-    const lock = await redis.set(`lock:${taskId}`, "locked", "NX", "EX", 60);
-
-    if (lock) {
-      console.log(`Task ${taskId}: ${message}`);
-
-      // OPTIONAL: call external API
-      // await axios.post("http://localhost:5000/test", { message });
-
-      // update counter in Redis
-      const data = await redis.get(`task:${taskId}`);
-      if (data) {
-        const updated = JSON.parse(data);
-        updated.counter++;
-        await redis.set(`task:${taskId}`, JSON.stringify(updated));
-      }
-    }
-  });
-
-  // store job reference in memory
-  runningJobs[taskId] = job;
 
   res.json({ message: "Task scheduled", id: taskId });
 });
 
-// ✅ GET ALL TASKS
+// 🔹 GET TASKS
 app.get("/tasks", async (req, res) => {
   const keys = await redis.keys("task:*");
 
@@ -68,23 +50,46 @@ app.get("/tasks", async (req, res) => {
   res.json(tasks.map(t => JSON.parse(t)));
 });
 
-// ❌ DELETE TASK
+// 🔹 GET LOGS
+app.get("/logs/:id", async (req, res) => {
+  const logs = await redis.lrange(`logs:${req.params.id}`, 0, -1);
+  res.json(logs);
+});
+
+// 🔹 DELETE TASK
 app.delete("/task/:id", async (req, res) => {
   const taskId = req.params.id;
 
-  const data = await redis.get(`task:${taskId}`);
-  if (!data) return res.status(404).send("Task not found");
-
-  // stop cron job
-  if (runningJobs[taskId]) {
-    runningJobs[taskId].stop();
-    delete runningJobs[taskId];
-  }
-
-  // remove from Redis
   await redis.del(`task:${taskId}`);
+  await redis.del(`logs:${taskId}`);
 
   res.send("Task deleted");
+});
+
+app.get("/ui-tasks", async (req, res) => {
+  const keys = await redis.keys("task:*");
+
+  const tasks = await Promise.all(
+    keys.map(key => redis.get(key))
+  );
+
+  const uiData = tasks.map(t => {
+    const task = JSON.parse(t);
+
+    return {
+      TaskId: task.id,
+      Time: task.time,
+      Message: task.message,
+      Counter: task.counter,
+      Status: task.status,
+      Actions: {
+        delete: `/task/${task.id}`,
+        logs: `/logs/${task.id}`
+      }
+    };
+  });
+
+  res.json(uiData);
 });
 
 app.listen(5000, () => {
